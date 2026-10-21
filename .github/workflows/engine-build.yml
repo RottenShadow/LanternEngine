@@ -1,0 +1,619 @@
+name: Build Windows package
+
+# Builds the engine from DarkIzuku/bloodborne_pc at the pinned tag with this repository's
+# engine/bbhost-changes.patch applied, runs the engine tests, and assembles the full Windows
+# package (launcher, forwarders, engine, and fetched runtime assets) as a GitHub Release asset
+# when a v* tag is pushed.
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: engine-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      UPSTREAM_REPO: DarkIzuku/bloodborne_pc
+      UPSTREAM_REF: v0.4.0-darkizuku-preview.1
+
+    steps:
+      - name: Use LF line endings
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout Lantern Engine
+        uses: actions/checkout@v4
+        with:
+          path: lantern
+
+      - name: Checkout engine upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: engine-src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Apply Lantern Engine patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $patch = "$env:GITHUB_WORKSPACE/lantern/engine/bbhost-changes.patch"
+          git -C engine-src apply --whitespace=nowarn $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to apply engine/bbhost-changes.patch' }
+          Copy-Item "$env:GITHUB_WORKSPACE/lantern/engine/win_compat.h" "engine-src/gpu/win_compat.h" -Force
+
+          # image-overlap-test links only tests/test_gpu_runtime_stubs.cpp, but the patch leaves
+          # these four definitions in tests/shader_lab.cpp. Move them to the shared stubs so both
+          # image-overlap-test and bb-shader-lab link without duplicate definitions.
+          $lab = 'engine-src/tests/shader_lab.cpp'
+          $stubs = 'engine-src/tests/test_gpu_runtime_stubs.cpp'
+          $labText = [IO.File]::ReadAllText($lab).Replace("`r`n", "`n")
+          $definitions = @(
+              'void runtime_blocked_report(void) {}'
+              '[[noreturn]] void runtime_thread_exit(void*) { std::abort(); }'
+              'int runtime_pad_type(void) { return 0; }'
+              'int runtime_pad_button(uint32_t, int) { return 0; }'
+          )
+          foreach ($definition in $definitions) {
+              $pattern = '(?m)^[ \t]*' + [regex]::Escape($definition) + '[ \t]*\r?\n?'
+              $labText = [regex]::Replace($labText, $pattern, '')
+          }
+          if ($labText -match 'runtime_pad_button') {
+              Select-String -Path $lab -Pattern 'runtime_blocked_report' -Context 3,8 |
+                  ForEach-Object { Write-Host $_.ToString() }
+              throw 'Could not remove the shader_lab stubs; update the workflow workaround.'
+          }
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText($lab, $labText, $utf8)
+          $stubText = @'
+
+          extern "C" {
+          void runtime_blocked_report(void) {}
+          [[noreturn]] void runtime_thread_exit(void*) { std::abort(); }
+          int runtime_pad_type(void) { return 0; }
+          int runtime_pad_button(uint32_t, int) { return 0; }
+          }
+          '@
+          $stubText = $stubText.Replace("`r`n", "`n")
+          [IO.File]::AppendAllText($stubs, $stubText, $utf8)
+          if (-not (Select-String -Path $stubs -Pattern 'runtime_pad_button' -Quiet)) {
+              throw 'Shared test stubs were not updated.'
+          }
+
+      - name: Resolve version and engine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF_TYPE -ne 'tag') {
+              throw "Release builds must be triggered by a tag (got '$($env:GITHUB_REF_TYPE)')."
+          }
+          $tag = $env:GITHUB_REF_NAME.Trim()
+          if ($tag -notmatch '^v') {
+              throw "Release tags must start with lowercase 'v' (got '$tag')."
+          }
+          $version = $tag.Substring(1)
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$') {
+              throw "Invalid version '$version' (expected e.g. 0.9.34-beta.9.9)."
+          }
+
+          $updater = Get-Content 'lantern/launcher/windows/BloodborneLauncher/Core/Updater.cs' -Raw
+          $match = [regex]::Match($updater, 'EngineId\s*=\s*"([^"]+)"')
+          if (-not $match.Success) { throw 'Updater.cs EngineId was not found.' }
+          $engine = $match.Groups[1].Value
+
+          $numeric = $version.Split('-')[0]
+          $parts = @($numeric.Split('.'))
+          while ($parts.Count -lt 4) { $parts += '0' }
+          $assembly = ($parts[0..3] -join '.')
+
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::AppendAllText($env:GITHUB_ENV,
+              "TAG=$tag`nVERSION=$version`nENGINE=$engine`nASSEMBLY_VERSION=$assembly`n", $utf8)
+          Write-Host "Release tag: $tag"
+          Write-Host "Package version: $version"
+          Write-Host "Engine id: $engine"
+          Write-Host "Assembly version: $assembly"
+
+      - name: Setup MSYS2 CLANG64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            git
+            curl
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-libc++
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-sdl3
+            mingw-w64-clang-x86_64-boost
+            mingw-w64-clang-x86_64-fmt
+            mingw-w64-clang-x86_64-glslang
+            mingw-w64-clang-x86_64-ntldd
+            mingw-w64-clang-x86_64-spirv-cross
+            mingw-w64-clang-x86_64-spirv-headers
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-vulkan-memory-allocator
+            mingw-w64-clang-x86_64-xxhash
+            mingw-w64-clang-x86_64-zydis
+            mingw-w64-clang-x86_64-robin-map
+            mingw-w64-clang-x86_64-ffmpeg
+            mingw-w64-clang-x86_64-protobuf
+            mingw-w64-clang-x86_64-nlohmann-json
+            mingw-w64-clang-x86_64-openssl
+            mingw-w64-clang-x86_64-miniupnpc
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-expat
+
+      - name: Build engine
+        shell: msys2 {0}
+        working-directory: engine-src
+        env:
+          CC: clang
+          CXX: clang++
+          BB_JOBS: 4
+        run: |
+          set -e
+          export CFLAGS="-Wno-error=unused-but-set-global"
+          export CXXFLAGS="-include $(cygpath -m "$PWD/gpu/win_compat.h")"
+          bash build.sh
+
+      - name: Run input and core regression tests
+        shell: msys2 {0}
+        working-directory: engine-src
+        run: |
+          set -e
+          ninja -C out/gpu \
+            pc-input-test \
+            pipeline-cache-blob-test \
+            pipeline-archive-test \
+            pipeline-compile-test \
+            motion-history-test \
+            occlusion-test \
+            motion-shader-test \
+            image-overlap-test \
+            settings-test \
+            ui-composition-test \
+            engine-hooks-test \
+            engine-menu-memory-test \
+            rebirth-refund-test
+          out/gpu/pc-input-test.exe
+          out/gpu/pipeline-cache-blob-test.exe
+          out/gpu/pipeline-archive-test.exe
+          out/gpu/pipeline-compile-test.exe
+          out/gpu/motion-history-test.exe
+          out/gpu/occlusion-test.exe
+          out/gpu/motion-shader-test.exe
+          out/gpu/image-overlap-test.exe
+          out/gpu/settings-test.exe
+          out/gpu/ui-composition-test.exe
+          out/gpu/engine-hooks-test.exe
+          out/gpu/engine-menu-memory-test.exe
+          out/gpu/rebirth-refund-test.exe
+          test -f out/bb-shader-lab.exe
+          python -m unittest discover -s tests -p 'test_prepare.py'
+          python -m unittest discover -s tests -p 'test_patches.py'
+          python -m unittest discover -s tests -p 'test_game_check.py'
+          python -m unittest discover -s tests -p 'test_windows_frame_rate.py'
+          python -m unittest discover -s tests -p 'test_engine_assets.py'
+          python -m unittest discover -s tests -p 'test_online.py'
+
+      - name: Fetch DLSS and FSR assets
+        shell: msys2 {0}
+        working-directory: engine-src
+        run: |
+          set -e
+          bash tools/fetch_dlss.sh out
+
+          # fsr4_optimize.sh is optional, and its glslangValidator invocation fails in this
+          # image. Hide the optimizer tools from PATH while keeping curl and coreutils.
+          path_dirs=()
+          IFS=':' read -r -a path_dirs <<< "$PATH"
+          fsr4_path=''
+          for dir in "${path_dirs[@]}"; do
+            [ -n "$dir" ] || continue
+            if [ -x "$dir/spirv-cross" ] || [ -x "$dir/spirv-cross.exe" ] ||
+               [ -x "$dir/glslangValidator" ] || [ -x "$dir/glslangValidator.exe" ]; then
+              continue
+            fi
+            fsr4_path="${fsr4_path:+$fsr4_path:}$dir"
+          done
+          if ! PATH="$fsr4_path" command -v curl >/dev/null; then
+            echo 'curl is not available after hiding the FSR4 optimizer tools.' >&2
+            exit 1
+          fi
+          PATH="$fsr4_path" bash tools/fetch_fsr4_assets.sh
+
+          test -f out/nvngx_dlss.dll
+          test -f fsr4_shaders/rcas.spv
+
+      - name: Fetch FSR4 Vulkan upscaler
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/0xCydral/bloodborne_pc/releases/download/windows-v1.7.0-beta.2/fsr4vk-v0.4.3-amdfix.zip'
+          $zip = Join-Path $env:RUNNER_TEMP 'fsr4vk.zip'
+          $raw = Join-Path $env:RUNNER_TEMP 'fsr4vk-extract'
+          $dest = Join-Path $env:RUNNER_TEMP 'fsr4vk'
+          foreach ($path in @($zip, $raw, $dest)) {
+              if (Test-Path $path) { Remove-Item $path -Recurse -Force -Confirm:$false }
+          }
+          curl.exe -fsSL --retry 3 --retry-delay 2 -o $zip $url
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download the FSR4 Vulkan upscaler.' }
+          New-Item -ItemType Directory -Force $raw | Out-Null
+          & tar.exe -xf $zip -C $raw
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract the FSR4 Vulkan upscaler.' }
+          $dll = Get-ChildItem $raw -Recurse -Filter 'amd_fidelityfx_upscaler_vk.dll' -File | Select-Object -First 1
+          if (-not $dll) { throw 'amd_fidelityfx_upscaler_vk.dll was not found in the archive.' }
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Get-ChildItem -LiteralPath $dll.Directory.FullName -Force |
+              Copy-Item -Destination $dest -Recurse -Force
+          if (-not (Test-Path (Join-Path $dest 'amd_fidelityfx_upscaler_vk.dll'))) {
+              throw 'Failed to stage the FSR4 Vulkan upscaler.'
+          }
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish launcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'dist/launcher'
+          $csproj = Join-Path $env:GITHUB_WORKSPACE 'lantern/launcher/windows/BloodborneLauncher/BloodborneLauncher.csproj'
+          dotnet publish $csproj -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=none `
+            -p:Version=$env:VERSION `
+            -p:InformationalVersion=$env:VERSION `
+            -p:AssemblyVersion=$env:ASSEMBLY_VERSION `
+            -p:FileVersion=$env:ASSEMBLY_VERSION `
+            -o $out --nologo -v minimal
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
+          $exe = Join-Path $out 'Lantern Engine.exe'
+          if (-not (Test-Path $exe)) { throw 'Lantern Engine.exe was not produced.' }
+          $item = Get-Item $exe
+          if ($item.Length -lt 20MB) { throw 'Launcher is unexpectedly small.' }
+          $info = $item.VersionInfo
+          if ($info.ProductVersion -notlike "$env:VERSION*" -and
+              $info.FileVersion -notlike "$env:ASSEMBLY_VERSION*") {
+              throw "Launcher version mismatch: product '$($info.ProductVersion)', file '$($info.FileVersion)'."
+          }
+          Write-Host ("Launcher: {0} ({1:N1} MB)" -f $info.ProductVersion, ($item.Length / 1MB))
+
+      - name: Assemble full package
+        shell: msys2 {0}
+        working-directory: engine-src
+        env:
+          FSR4VK_DIR: ${{ runner.temp }}/fsr4vk
+        run: |
+          set -e
+          stage=../package/BloodbornePC
+          rm -rf ../package
+          mkdir -p "$stage/engine/out" "$stage/engine/data" "$stage/engine/licenses"
+
+          cp -f out/bb-probe.exe out/bb-start.exe out/bb-gpu-capabilities.exe out/bb-engine-assets.exe "$stage/engine/out/"
+          test -f out/bb-shader-lab.exe
+          cp -f out/bb-shader-lab.exe "$stage/engine/out/"
+          test ! -f out/gpu-cache.id || cp -f out/gpu-cache.id "$stage/engine/out/"
+          test ! -f out/gpu-cache.legacy.id || cp -f out/gpu-cache.legacy.id "$stage/engine/out/"
+          test -f out/nvngx_dlss.dll
+          cp -f out/nvngx_dlss.dll "$stage/engine/out/"
+          cp -f ../lantern/launcher/windows/BloodborneLauncher/app.ico "$stage/engine/out/bloodborne.ico"
+
+          # The CLANG64 DLLs the programs load (SDL3, libc++, libunwind, ffmpeg, ...).
+          # ntldd resolves PE imports without running the binaries and includes transitive
+          # dependencies that ldd can miss.
+          command -v ntldd >/dev/null
+          copy_deps() {
+            local exe="$1"
+            ntldd -R -D "$(cygpath -w /clang64/bin)" "$exe" 2>/dev/null |
+              awk '/=>/ {print $3}' |
+              sed 's#\\#/#g' |
+              grep -E 'clang64/bin/.*\.dll$' || true
+          }
+          for exe in out/bb-probe.exe out/bb-gpu-capabilities.exe out/bb-engine-assets.exe out/bb-shader-lab.exe; do
+            [ ! -f "$exe" ] && continue
+            while IFS= read -r dll; do
+              dll=$(cygpath -u "$dll")
+              [ -f "$dll" ] && cp -f "$dll" "$stage/engine/out/"
+            done < <(copy_deps "$exe")
+          done
+
+          cp -rf patches "$stage/engine/"
+          cp -f data/image_109_hashes.txt "$stage/engine/data/"
+          test ! -d licenses || cp -rf licenses "$stage/engine/"
+          test ! -f out/LICENSE-DLSS-SDK.txt || cp -f out/LICENSE-DLSS-SDK.txt "$stage/engine/licenses/"
+          mkdir -p "$stage/engine/licenses/msys2"
+          if [ -d /clang64/share/licenses ]; then
+            cp -rf /clang64/share/licenses/. "$stage/engine/licenses/msys2/"
+          fi
+          cp -rf fsr4_shaders "$stage/engine/"
+
+          fsr4vk=$(cygpath -u "$FSR4VK_DIR")
+          test -d "$fsr4vk"
+          cp -rf "$fsr4vk" "$stage/engine/fsr4vk"
+          test -f "$stage/engine/fsr4vk/amd_fidelityfx_upscaler_vk.dll"
+
+          find "$stage/engine" -type d -name __pycache__ -prune -exec rm -rf {} +
+          find "$stage/engine" -type f -name '*.pyc' -delete
+
+          test -f "$stage/engine/out/bb-probe.exe"
+          test -f "$stage/engine/out/bb-start.exe"
+          test -f "$stage/engine/out/bb-shader-lab.exe"
+          test -f "$stage/engine/out/SDL3.dll"
+          test -f "$stage/engine/out/libc++.dll"
+          test -f "$stage/engine/out/nvngx_dlss.dll"
+          test -f "$stage/engine/out/bloodborne.ico"
+          echo "Engine package:"
+          find "$stage/engine" -maxdepth 2 -type f -printf '%p\n' | sort | head -100
+
+      - name: Fetch official shader catalog and defaults
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+              'User-Agent' = 'LanternEngine-build'
+              'Accept' = 'application/vnd.github+json'
+              'Authorization' = "Bearer $env:GH_TOKEN"
+          }
+          $releases = Invoke-RestMethod -Headers $headers `
+              -Uri 'https://api.github.com/repos/Awakenchan/LanternEngine/releases?per_page=30'
+          $release = $releases |
+              Where-Object {
+                  -not $_.draft -and
+                  @($_.assets | Where-Object { $_.name -like 'LanternEngine-*.zip' }).Count -gt 0
+              } |
+              Select-Object -First 1
+          if (-not $release) { throw 'No official Lantern Engine release with a package was found.' }
+          $asset = $release.assets |
+              Where-Object { $_.name -like 'LanternEngine-*.zip' } |
+              Select-Object -First 1
+          if (-not $asset) { throw "Release $($release.tag_name) has no LanternEngine zip." }
+
+          $zip = Join-Path $env:RUNNER_TEMP 'official-lantern.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'official-lantern'
+          foreach ($path in @($zip, $dir)) {
+              if (Test-Path $path) { Remove-Item $path -Recurse -Force -Confirm:$false }
+          }
+          curl.exe -fsSL --retry 3 --retry-delay 2 -o $zip $asset.browser_download_url
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download the official package.' }
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          & tar.exe -xf $zip -C $dir
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract the official package.' }
+
+          $bbport = Get-ChildItem $dir -Recurse -Filter 'bbport.ini' -File | Select-Object -First 1
+          if (-not $bbport) { throw 'bbport.ini was not found in the official package.' }
+          $root = $bbport.Directory
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'package/BloodbornePC'
+          $engine = Join-Path $stage 'engine'
+          $catalog = Join-Path $root.FullName 'engine/shader-catalog'
+          $controller = Join-Path $root.FullName 'engine/gamecontrollerdb.txt'
+          if (-not (Test-Path $catalog)) { throw 'Official shader-catalog was not found.' }
+          if (-not (Test-Path $controller)) { throw 'Official gamecontrollerdb.txt was not found.' }
+
+          Copy-Item -LiteralPath $catalog -Destination $engine -Recurse -Force
+          Copy-Item -LiteralPath $controller -Destination $engine -Force
+          Copy-Item -LiteralPath $bbport.FullName -Destination $stage -Force
+          $source = Join-Path $root.FullName 'engine/fsr4vk/SOURCE.txt'
+          if (Test-Path $source) {
+              Copy-Item -LiteralPath $source -Destination (Join-Path $engine 'fsr4vk/SOURCE.txt') -Force
+          }
+
+          $ini = Join-Path $stage 'bbport.ini'
+          $lines = [IO.File]::ReadAllLines($ini) | Where-Object { $_ -notmatch '^\s*menu_pos\s*=' }
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllLines($ini, $lines, $utf8)
+
+          $profile = Get-ChildItem (Join-Path $engine 'shader-catalog') -Recurse -Filter 'profile.bin' -File |
+              Select-Object -First 1
+          if (-not $profile) { throw 'Official shader catalog has no profile.bin.' }
+          Write-Host "Official extras: $($release.tag_name), catalog $(Split-Path $profile.DirectoryName -Leaf)"
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Build launcher forwarders
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $windows = Join-Path $env:GITHUB_WORKSPACE 'lantern/launcher/windows'
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'package/BloodbornePC'
+
+          function Build-Forwarder {
+              param([string]$Dir, [string]$Resource, [string]$Output)
+              Push-Location (Join-Path $windows $Dir)
+              try {
+                  & cl.exe /nologo /O2 /MT /W4 /DUNICODE /D_UNICODE /c main.c "/Fo:$Dir.obj"
+                  if ($LASTEXITCODE -ne 0) { throw "cl failed for $Dir" }
+                  & rc.exe /nologo /fo "$Dir.res" $Resource
+                  if ($LASTEXITCODE -ne 0) { throw "rc failed for $Dir" }
+                  & link.exe /nologo /SUBSYSTEM:WINDOWS "/OUT:$Output" "$Dir.obj" "$Dir.res" user32.lib
+                  if ($LASTEXITCODE -ne 0) { throw "link failed for $Dir" }
+              } finally {
+                  Pop-Location
+              }
+          }
+
+          Build-Forwarder 'BloodbornePlay' 'play.rc' (Join-Path $stage 'Bloodborne.exe')
+          Build-Forwarder 'LanternForward' 'forward.rc' (Join-Path $stage 'Bloodborne Launcher.exe')
+
+          foreach ($name in @('Bloodborne.exe', 'Bloodborne Launcher.exe')) {
+              $item = Get-Item (Join-Path $stage $name)
+              if ($item.Length -ge 1MB) { throw "$name is unexpectedly large." }
+              Write-Host ("Forwarder: {0} ({1:N0} KB)" -f $name, ($item.Length / 1KB))
+          }
+
+      - name: Finalize package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'package/BloodbornePC'
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force $dist | Out-Null
+
+          $launcher = Join-Path $env:GITHUB_WORKSPACE 'dist/launcher/Lantern Engine.exe'
+          if (-not (Test-Path $launcher)) { throw 'Published launcher was not found.' }
+          Copy-Item -LiteralPath $launcher -Destination $stage -Force
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'lantern/LICENSE') -Destination $stage -Force
+
+          $package = [ordered]@{ version = $env:VERSION; engine = $env:ENGINE }
+          $json = ($package | ConvertTo-Json -Compress) + "`n"
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText((Join-Path $stage 'package.json'), $json, $utf8)
+
+          foreach ($name in @(
+              'Lantern Engine.exe', 'Bloodborne.exe', 'Bloodborne Launcher.exe',
+              'LICENSE', 'package.json', 'bbport.ini'
+          )) {
+              if (-not (Test-Path (Join-Path $stage $name))) { throw "Missing package root file: $name" }
+          }
+          foreach ($name in @(
+              'engine/out/bb-probe.exe', 'engine/out/bb-start.exe',
+              'engine/out/bb-gpu-capabilities.exe', 'engine/out/bb-engine-assets.exe',
+              'engine/out/bb-shader-lab.exe', 'engine/out/SDL3.dll', 'engine/out/libc++.dll',
+              'engine/out/nvngx_dlss.dll', 'engine/out/bloodborne.ico',
+              'engine/data/image_109_hashes.txt', 'engine/patches/Bloodborne.xml',
+              'engine/fsr4_shaders/rcas.spv',
+              'engine/fsr4vk/amd_fidelityfx_upscaler_vk.dll',
+              'engine/gamecontrollerdb.txt'
+          )) {
+              if (-not (Test-Path (Join-Path $stage $name))) { throw "Missing package file: $name" }
+          }
+          if (-not (Get-ChildItem (Join-Path $stage 'engine/shader-catalog') -Recurse -Filter 'profile.bin' -File |
+                  Select-Object -First 1)) {
+              throw 'Missing shader-catalog profile.bin.'
+          }
+          Write-Host ("Package staged: {0:N0} files, {1:N1} MB" -f
+              (Get-ChildItem $stage -Recurse -File).Count,
+              ((Get-ChildItem $stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB))
+
+      - name: Create and verify release zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'package/BloodbornePC'
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $zip = Join-Path $dist "LanternEngine-$env:TAG-win64.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force -Confirm:$false }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::CreateFromDirectory(
+              $stage, $zip, [IO.Compression.CompressionLevel]::Optimal, $true)
+
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+              $names = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+              $required = @(
+                  'BloodbornePC/Lantern Engine.exe',
+                  'BloodbornePC/Bloodborne.exe',
+                  'BloodbornePC/Bloodborne Launcher.exe',
+                  'BloodbornePC/LICENSE',
+                  'BloodbornePC/package.json',
+                  'BloodbornePC/bbport.ini',
+                  'BloodbornePC/engine/out/bb-probe.exe',
+                  'BloodbornePC/engine/out/bb-start.exe',
+                  'BloodbornePC/engine/out/bb-gpu-capabilities.exe',
+                  'BloodbornePC/engine/out/bb-engine-assets.exe',
+                  'BloodbornePC/engine/out/bb-shader-lab.exe',
+                  'BloodbornePC/engine/out/SDL3.dll',
+                  'BloodbornePC/engine/out/libc++.dll',
+                  'BloodbornePC/engine/out/nvngx_dlss.dll',
+                  'BloodbornePC/engine/out/bloodborne.ico',
+                  'BloodbornePC/engine/patches/Bloodborne.xml',
+                  'BloodbornePC/engine/data/image_109_hashes.txt',
+                  'BloodbornePC/engine/fsr4_shaders/rcas.spv',
+                  'BloodbornePC/engine/fsr4vk/amd_fidelityfx_upscaler_vk.dll',
+                  'BloodbornePC/engine/gamecontrollerdb.txt'
+              )
+              $missing = @($required | Where-Object { $names -notcontains $_ })
+              if ($missing.Count) { throw "Zip is missing: $($missing -join ', ')" }
+              if (-not ($names | Where-Object {
+                      $_ -like 'BloodbornePC/engine/shader-catalog/*/profile.bin'
+                  } | Select-Object -First 1)) {
+                  throw 'Zip is missing the shader catalog profile.bin.'
+              }
+              $bad = @($names | Where-Object {
+                  $_ -match '(?i)^BloodbornePC/(user|logs|mods|network|engine-assets)/' -or
+                  $_ -match '(?i)^BloodbornePC/engine/(scripts|tools)/' -or
+                  $_ -match '(?i)^BloodbornePC/engine/out/.+\.(bin|elf|json|txt)$' -or
+                  $_ -match '(?i)\.(orig|bak|old)$' -or
+                  $_ -match '(?i)build-stamp' -or
+                  $_ -match '(?i)(^|/)__pycache__/' -or
+                  $_ -match '(?i)\.pyc$'
+              })
+              if ($bad.Count) {
+                  throw "Refusing to ship $($bad.Count) dev/game files, e.g. $($bad[0])"
+              }
+          } finally {
+              $archive.Dispose()
+          }
+          $zips = @(Get-ChildItem $dist -Filter 'LanternEngine-*-win64.zip' -File)
+          if ($zips.Count -ne 1) {
+              throw "Expected exactly one package zip in dist, found $($zips.Count)."
+          }
+          Write-Host ("Zip: {0} ({1:N0} MB)" -f $zips[0].Name, ($zips[0].Length / 1MB))
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = $env:TAG
+          $zip = Get-Item (Join-Path $env:GITHUB_WORKSPACE "dist/LanternEngine-$tag-win64.zip")
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "Release $tag already exists; replacing package asset."
+              gh release upload $tag $zip.FullName --clobber
+              if ($LASTEXITCODE -ne 0) { throw "Failed to upload $($zip.Name) to release $tag." }
+          } else {
+              Write-Host "Creating release $tag."
+              $releaseArgs = @(
+                  'release', 'create', $tag, $zip.FullName,
+                  '--verify-tag',
+                  '--title', "Lantern Engine $tag",
+                  '--notes', "Automated Windows package build for $tag."
+              )
+              if ($env:VERSION -match '-') { $releaseArgs += '--prerelease' }
+              & gh @releaseArgs
+              if ($LASTEXITCODE -ne 0) { throw "Failed to create release $tag." }
+          }
+          Write-Host ("Release asset: {0} ({1:N0} MB)" -f $zip.Name, ($zip.Length / 1MB))
+
+      - name: Upload GPU build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-build-log-${{ github.sha }}
+          path: engine-src/out/gpu-build.log
+          if-no-files-found: ignore
+          retention-days: 7
