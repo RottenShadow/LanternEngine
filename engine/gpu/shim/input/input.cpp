@@ -86,14 +86,14 @@ float g_drag_anchor = 0;
 int g_drag_steps = 0;
 bool g_drag_released = true;
 
-std::uint32_t DpadFromKeys(const bool* keys, const bool held[kBindCount], bool keys_move_hunter) {
+// The arrows navigate menus; the movement keys stay movement (left stick).
+std::uint32_t DpadFromKeys(const bool* keys) {
     if (!keys) return 0;
-    const bool movement = !keys_move_hunter;
     std::uint32_t dpad = 0;
-    if (keys[SDL_SCANCODE_UP] || (movement && held[kBindMoveF])) dpad |= kUp;
-    if (keys[SDL_SCANCODE_DOWN] || (movement && held[kBindMoveB])) dpad |= kDown;
-    if (keys[SDL_SCANCODE_LEFT] || (movement && held[kBindMoveL])) dpad |= kLeft;
-    if (keys[SDL_SCANCODE_RIGHT] || (movement && held[kBindMoveR])) dpad |= kRight;
+    if (keys[SDL_SCANCODE_UP]) dpad |= kUp;
+    if (keys[SDL_SCANCODE_DOWN]) dpad |= kDown;
+    if (keys[SDL_SCANCODE_LEFT]) dpad |= kLeft;
+    if (keys[SDL_SCANCODE_RIGHT]) dpad |= kRight;
     return dpad;
 }
 
@@ -166,10 +166,12 @@ std::uint32_t DragValue(const MouseRead& mouse, bool preview) {
 }
 
 void AddKeyboardAndMouse(PadState& pad, const bool* keys, int nkeys, const MouseRead& mouse, bool menu,
-                         bool keys_move_hunter, bool camera) {
+                         bool keys_move_hunter, bool camera, bool& keyboard_move_x, bool& keyboard_move_y) {
     const auto& s = BbSettings::Get();
     bool held[kBindCount] = {};
     if (keys) host_bindings_keys_held(keys, nkeys, held);
+    keyboard_move_x = held[kBindMoveL] || held[kBindMoveR];
+    keyboard_move_y = held[kBindMoveF] || held[kBindMoveB];
     if (g_device.load(std::memory_order_relaxed) == InputDevice::KeyboardMouse) {
 
         for (std::uint8_t* stick : {&pad.lx, &pad.ly, &pad.rx, &pad.ry}) {
@@ -178,7 +180,7 @@ void AddKeyboardAndMouse(PadState& pad, const bool* keys, int nkeys, const Mouse
     }
     const std::uint64_t now = SDL_GetTicks();
     const bool navigating = menu && !keys_move_hunter && MenuPointer::Navigating() && now >= g_settle_until;
-    const std::uint32_t dpad = DpadFromKeys(keys, held, keys_move_hunter);
+    const std::uint32_t dpad = DpadFromKeys(keys);
     g_dpad_blocked &= dpad;
     if (keys && !menu) WatchSprint(held);
     if ((navigating || keys_move_hunter) && keys) {
@@ -186,7 +188,6 @@ void AddKeyboardAndMouse(PadState& pad, const bool* keys, int nkeys, const Mouse
         if (keys[SDL_SCANCODE_RETURN]) pad.buttons |= menu_confirm_button();
         if (keys[SDL_SCANCODE_BACKSPACE]) pad.buttons |= menu_back_button();
         if (!keys_move_hunter) {
-            for (int a = kBindMoveF; a <= kBindMoveR; ++a) held[a] = false;
             for (int a = kBindLookU; a <= kBindLookR; ++a) held[a] = false;
         }
     }
@@ -463,17 +464,25 @@ extern "C" int bbgpu_pc_input(BbPcPad* d, const bool* keys, int nkeys, int gamep
     bool any_down = mouse.held != 0;
     for (int i = 0; keys && i < nkeys && !any_down; ++i) any_down = keys[i];
     host_bind_capture_note_held(any_down);
+    bool keyboard_move_x = false, keyboard_move_y = false;
     if (!g_focused || g_text_entry || host_bind_capture_blocking()) {
 
         pad = PadState{};
         g_wants_relative = false;
     } else {
-        AddKeyboardAndMouse(pad, keys, nkeys, mouse, menu, keys_move_hunter, camera);
+        AddKeyboardAndMouse(pad, keys, nkeys, mouse, menu, keys_move_hunter, camera, keyboard_move_x, keyboard_move_y);
+    }
+    // The menu pointer sees the keyboard movement keys as resting (so mouse hover and click work
+    // while a menu has the screen); the pad handed to the game keeps the real left stick.
+    PadState host_snapshot = pad;
+    if (menu) {
+        if (keyboard_move_x) host_snapshot.lx = kStickRest;
+        if (keyboard_move_y) host_snapshot.ly = kStickRest;
     }
     SpectateButton(pad.buttons);
     {
         std::scoped_lock lock(g_pad_lock);
-        g_last_pad = pad;
+        g_last_pad = host_snapshot;
     }
     d->buttons = pad.buttons;
     d->lx = pad.lx;
