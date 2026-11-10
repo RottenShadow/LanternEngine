@@ -34,3 +34,5 @@ patches.json
 *.dll
 # Intel XeSS SDK files (tools/fetch_xess.sh): downloaded, never in the repository
 /xess/
+# isa-scan
+/tools/isa-scan/target/
